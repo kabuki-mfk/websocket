@@ -40,29 +40,24 @@ type bufArray struct {
 }
 
 func _NewBufArray(arrays ...[]byte) *bufArray {
+	l := len(arrays)
+
 	if len(arrays) == 1 {
 		return &bufArray{
 			data: arrays[0],
 		}
 	}
 
-	var head, tail, temp *bufArray
-	for i := 0; i < len(arrays); i++ {
+	head := &bufArray{}
+	tail := head
+	for i := 0; i < l; i++ {
 		array := arrays[i]
 
-		if i == 0 {
-			head = &bufArray{
-				data: array,
-			}
-			temp = head
-			continue
+		tail.data = array
+		if i < l-1 {
+			tail.next = &bufArray{}
+			tail = tail.next
 		}
-
-		tail = &bufArray{
-			data: array,
-		}
-		temp.next = tail
-		temp = tail
 	}
 
 	return head
@@ -216,7 +211,7 @@ func transfor(dst BaseBuf, src BaseBuf) int {
 }
 
 func transforWithBound(dst BaseBuf, dFrom, dTo int, src BaseBuf, sFrom, sTo int) int {
-	dstLen, srcLen := dTo - dFrom, sTo - sFrom
+	dstLen, srcLen := dTo-dFrom, sTo-sFrom
 	if dstLen < 1 || srcLen < 1 {
 		return 0
 	}
@@ -291,7 +286,7 @@ func bufGetBytes(srcBuf BaseBuf, i int, dst []byte) error {
 			if dstLen < 1 {
 				break
 			}
-			
+
 			if array.next == nil {
 				break
 			}
@@ -337,7 +332,186 @@ func bufSetBytes(dstBuf BaseBuf, i int, src []byte) error {
 	}
 
 	return nil
-} 
+}
+
+func bufWriteBytes(dstBuf BaseBuf, src []byte) (n int, err error) {
+	dstLen := dstBuf.WriteableBytes()
+	if dstLen < 1 {
+		return 0, ErrInSufficientBytes
+	}
+	wIndex := dstBuf.GetWriteIndex()
+	offset, array := findArray(dstBuf.Array(), wIndex)
+
+	l := copy(array.data[offset:], src)
+	dstLen -= l
+	n += l
+
+	if dstLen > 1 && array.next != nil {
+		sOffset := l
+		array = array.next
+		for {
+			l = copy(array.data, src[sOffset:])
+			dstLen -= l
+			n += l
+
+			if dstLen < 1 {
+				break
+			}
+
+			if array.next == nil {
+				err = ErrInSufficientBytes
+				break
+			}
+
+			sOffset += l
+			array = array.next
+		}
+	}
+
+	dstBuf.WriteIndex(wIndex + n)
+	return n, err
+}
+
+func bufReadBytes(srcBuf BaseBuf, dst []byte) (n int, err error) {
+	dstLen := srcBuf.ReadableBytes()
+	if dstLen < 1 {
+		return 0, ErrInSufficientBytes
+	}
+	rIndex := srcBuf.GetReadIndex()
+	offset, array := findArray(srcBuf.Array(), rIndex)
+
+	l := copy(dst, array.data[offset:])
+	dstLen -= l
+	n += l
+
+	if dstLen > 1 && array.next != nil {
+		dOffset := l
+		array = array.next
+		for {
+			l = copy(dst[dOffset:], array.data)
+			dstLen -= l
+			n += l
+
+			if dstLen < 1 {
+				break
+			}
+
+			if array.next == nil {
+				err = ErrInSufficientBytes
+				break
+			}
+
+			dOffset += l
+			array = array.next
+		}
+	}
+
+	srcBuf.ReadIndex(rIndex + n)
+	return n, err
+}
+
+func bufWriteTo(buf BaseBuf, length int, w io.Writer) error {
+	if length > buf.ReadableBytes() {
+		length = buf.ReadableBytes()
+	}
+
+	readIndex := buf.GetReadIndex()
+	offset, array := findArray(buf.Array(), readIndex)
+
+	if length <= len(array.data)-offset {
+		wb, err := w.Write(array.data[offset : offset+length])
+
+		if wb < length && err == nil {
+			err = io.ErrShortWrite
+		}
+
+		buf.ReadIndex(readIndex + wb)
+		return err
+	} else {
+		wb, err := w.Write(array.data[offset:])
+		readIndex += wb
+
+		if wb < length && err == nil {
+			err = io.ErrShortWrite
+		}
+
+		length -= wb
+		for err != nil && length > 0 && array.Next() != nil {
+			array = array.next
+			srcLen := length
+
+			if srcLen > len(array.data) {
+				srcLen = len(array.data)
+			}
+
+			wb, err = w.Write(array.data[:srcLen])
+			length -= wb
+			readIndex += wb
+
+			if wb < length && err == nil {
+				err = io.ErrShortWrite
+			}
+		}
+
+		if err != nil {
+			buf.ReadIndex(readIndex)
+			return err
+		}
+	}
+
+	buf.ReadIndex(readIndex)
+	return nil
+}
+
+func bufReadFrom(buf BaseBuf, length int, r io.Reader) (n int, err error) {
+	if length > buf.WriteableBytes() {
+		length = buf.WriteableBytes()
+	}
+
+	writeIndex := buf.GetWriteIndex()
+	offset, array := findArray(buf.Array(), writeIndex)
+
+	if length <= len(array.data)-offset {
+		rb, err := r.Read(array.data[offset : offset+length])
+
+		if rb < length && err == nil {
+			err = ErrReadNoEnough
+		}
+
+		buf.WriteIndex(writeIndex + rb)
+		return rb, err
+	} else {
+		rb, err := r.Read(array.data[offset:])
+		writeIndex += rb
+		n += rb
+
+		if rb < length && err == nil {
+			return n, ErrReadNoEnough
+		}
+
+		length -= rb
+		for length > 0 && array.Next() != nil {
+			array = array.next
+			dstLen := length
+
+			if dstLen > len(array.data) {
+				dstLen = len(array.data)
+			}
+
+			rb, err = r.Read(array.data[:dstLen])
+			writeIndex += rb
+			n += rb
+
+			if err != nil {
+				return n, err
+			} else if rb < length {
+				return n, ErrReadNoEnough
+			}
+		}
+	}
+
+	return n, nil
+}
 
 func checkIndex(idx int, buf BaseBuf) error {
 	if idx < 0 {

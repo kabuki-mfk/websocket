@@ -6,7 +6,7 @@ import (
 )
 
 type sliceBuf struct {
-	src BaseBuf
+	sBufArray *bufArray
 
 	rIdx int
 	wIdx int
@@ -15,13 +15,73 @@ type sliceBuf struct {
 	dLen   int
 }
 
+func createSliceBufArray(src *bufArray, from, to int) *bufArray {
+	offset, srcBA := findArray(src, from)
+	sliceLen := to - from
+
+	head := &bufArray{}
+
+	l := len(srcBA.data) - offset
+	if l <= sliceLen {
+		head.data = srcBA.data[offset:]
+		sliceLen -= l
+	} else {
+		head.data = srcBA.data[offset : offset+sliceLen]
+		return head
+	}
+
+	head.next = &bufArray{}
+	pBA := head.next
+	for {
+		srcBA = src.next
+		l := len(srcBA.data)
+
+		if l <= sliceLen {
+			pBA.data = srcBA.data
+			sliceLen -= l
+		} else {
+			pBA.data = srcBA.data[:sliceLen]
+			sliceLen = 0
+			break
+		}
+
+		if sliceLen < 1 {
+			break
+		}
+
+		if src.next == nil {
+			panic(errors.New("out of bound on create slice"))
+		}
+
+		pBA.next = &bufArray{}
+		pBA = pBA.next
+	}
+
+	return head
+}
+
 func Slice(src BaseBuf, from, to int) BaseBuf {
+	if from < 0 || to < 0 {
+		panic(OutOfBufError("'from' and 'to' of slice must be a positive"))
+	}
+
+	size := src.Size()
+	if from > size || to > size {
+		panic(OutOfBufError("'from' or 'to' of slice out of Buffer"))
+	}
+
+	if from > to {
+		temp := from
+		from = to
+		to = temp
+	}
+
 	return &sliceBuf{
-		src:    src,
-		rIdx:   0,
-		wIdx:   0,
-		offset: from,
-		dLen:   to - from,
+		sBufArray: createSliceBufArray(src.Array(), from, to),
+		rIdx:      0,
+		wIdx:      0,
+		offset:    from,
+		dLen:      to - from,
 	}
 }
 
@@ -29,34 +89,26 @@ func (buf *sliceBuf) Size() int {
 	return buf.dLen
 }
 
-func (buf *sliceBuf) Array() []byte {
-	return buf.src.Array()[buf.offset : buf.offset+buf.dLen]
+func (buf *sliceBuf) Array() *bufArray {
+	return buf.sBufArray
 }
 
 func (buf *sliceBuf) Copy() BaseBuf {
 	cp := make([]byte, buf.Size())
-	copy(cp, buf.Array())
+	pBA := buf.sBufArray
+	for cpOffset := 0; cpOffset < buf.Size(); {
+		copy(cp, pBA.data)
+		pBA = pBA.next
+	}
 	return NewBufWithArray(cp)
 }
 
 func (buf *sliceBuf) WriteIndex(idx int) error {
-	err := checkIndex(idx, buf)
-	if err != nil {
-		return err
-	}
-
-	buf.rIdx = idx
-	return nil
+	return writeIndex(&buf.wIdx, idx, buf)
 }
 
 func (buf *sliceBuf) ReadIndex(idx int) error {
-	err := checkIndex(idx, buf)
-	if err != nil {
-		return err
-	}
-
-	buf.wIdx = idx
-	return nil
+	return readIndex(&buf.rIdx, idx, buf)
 }
 
 func (buf *sliceBuf) GetWriteIndex() int {
@@ -80,7 +132,7 @@ func (buf *sliceBuf) DiscardReadBytes() {
 		return
 	}
 
-	copy(buf.Array(), buf.Array()[buf.rIdx:buf.wIdx])
+	transforWithBound(buf, 0, buf.Size(), buf, buf.rIdx, buf.wIdx)
 }
 
 func (buf *sliceBuf) GetByte(i int) (b byte, err error) {
@@ -89,18 +141,12 @@ func (buf *sliceBuf) GetByte(i int) (b byte, err error) {
 		return 0, err
 	}
 
-	b = buf.Array()[i+buf.offset]
-	return
+	offset, array := findArray(buf.sBufArray, i)
+	return array.data[offset], nil
 }
 
 func (buf *sliceBuf) GetBytes(i int, dst []byte) error {
-	err := checkIndex(i, buf)
-	if err != nil {
-		return err
-	}
-
-	copy(dst, buf.Array()[i:])
-	return nil
+	return bufGetBytes(buf, i, dst)
 }
 
 func (buf *sliceBuf) SetByte(i int, b byte) error {
@@ -109,18 +155,13 @@ func (buf *sliceBuf) SetByte(i int, b byte) error {
 		return err
 	}
 
-	buf.Array()[i] = b
+	offset, array := findArray(buf.Array(), i)
+	array.data[offset] = b
 	return nil
 }
 
 func (buf *sliceBuf) SetBytes(i int, src []byte) error {
-	err := checkIndex(i, buf)
-	if err != nil {
-		return err
-	}
-
-	copy(buf.Array()[i:], src)
-	return err
+	return bufSetBytes(buf, i, src)
 }
 
 func (buf *sliceBuf) WriteTo(w io.Writer) error {
@@ -128,17 +169,7 @@ func (buf *sliceBuf) WriteTo(w io.Writer) error {
 }
 
 func (buf *sliceBuf) WriteToWithLen(len int, w io.Writer) error {
-	if len > buf.ReadableBytes() {
-		len = buf.ReadableBytes()
-	}
-
-	wb, err := w.Write(buf.Array()[buf.rIdx : buf.rIdx+len])
-	if wb < len && err == nil {
-		err = ErrInSufficientBytes
-	}
-
-	buf.rIdx += wb
-	return err
+	return bufWriteTo(buf, len, w)
 }
 
 func (buf *sliceBuf) WriteByte(b byte) error {
@@ -152,16 +183,7 @@ func (buf *sliceBuf) WriteByte(b byte) error {
 }
 
 func (buf *sliceBuf) WriteBytes(b []byte) (n int, err error) {
-	if buf.ReadableBytes() < 1 {
-		return 0, ErrInSufficientBytes
-	}
-
-	n = copy(buf.Array()[buf.wIdx:], b)
-	if n < len(b) {
-		err = ErrInSufficientBytes
-	}
-
-	return
+	return bufWriteBytes(buf, b)
 }
 
 func (buf *sliceBuf) WriteString(s string) (n int, err error) {
@@ -173,21 +195,7 @@ func (buf *sliceBuf) ReadFrom(r io.Reader) (n int, err error) {
 }
 
 func (buf *sliceBuf) ReadFromWithLen(len int, r io.Reader) (n int, err error) {
-	if buf.WriteableBytes() < 1 {
-		return 0, ErrInSufficientBytes
-	}
-
-	rb, err := r.Read(buf.Array()[buf.wIdx : buf.wIdx+len])
-
-	if rb < 0 {
-		panic(ReaderError("reader returned nagative count from Read"))
-	} else if rb < len {
-		err = ErrInSufficientBytes
-	}
-
-	buf.wIdx += rb
-
-	return rb, err
+	return bufReadFrom(buf, len, r)
 }
 
 func (buf *sliceBuf) ReadByte() (rb byte, err error) {
@@ -201,17 +209,7 @@ func (buf *sliceBuf) ReadByte() (rb byte, err error) {
 }
 
 func (buf *sliceBuf) ReadBytes(b []byte) (n int, err error) {
-	if buf.ReadableBytes() < 1 {
-		return 0, ErrInSufficientBytes
-	}
-
-	n = copy(buf.Array()[buf.rIdx:buf.wIdx], b)
-	if n < len(b) {
-		err = ErrReadNoEnough
-	}
-
-	buf.rIdx += n
-	return
+	return bufReadBytes(buf, b)
 }
 
 func (buf *sliceBuf) ReadString(len int) (rs string, err error) {
@@ -242,7 +240,7 @@ func (buf *duplicateBuf) Size() int {
 	return buf.src.Size()
 }
 
-func (buf *duplicateBuf) Array() []byte {
+func (buf *duplicateBuf) Array() *bufArray {
 	return buf.src.Array()
 }
 
@@ -293,7 +291,7 @@ func (buf *duplicateBuf) ReadableBytes() int {
 func (buf *duplicateBuf) DiscardReadBytes() {
 	if buf.rIdx > 0 {
 		if buf.rIdx != buf.wIdx {
-			buf.SetBytes(0, buf.Array()[buf.rIdx:buf.wIdx])
+			transforWithBound(buf, 0, buf.Size(), buf, buf.rIdx, buf.wIdx)
 			buf.wIdx -= buf.rIdx
 			buf.rIdx = 0
 		} else {
@@ -324,18 +322,7 @@ func (buf *duplicateBuf) WriteTo(w io.Writer) error {
 }
 
 func (buf *duplicateBuf) WriteToWithLen(len int, w io.Writer) error {
-	if len > buf.ReadableBytes() {
-		len = buf.ReadableBytes()
-	}
-
-	wb, err := w.Write(buf.Array()[buf.rIdx : buf.rIdx+len])
-
-	if wb < len && err == nil {
-		err = ErrInSufficientBytes
-	}
-
-	buf.rIdx += wb
-	return err
+	return bufWriteTo(buf, len, w)
 }
 
 func (buf *duplicateBuf) WriteByte(b byte) error {
@@ -349,16 +336,7 @@ func (buf *duplicateBuf) WriteByte(b byte) error {
 }
 
 func (buf *duplicateBuf) WriteBytes(b []byte) (n int, err error) {
-	if buf.WriteableBytes() < 1 {
-		return 0, ErrInSufficientBytes
-	}
-
-	n = copy(buf.Array()[buf.wIdx:], b)
-	if n < len(b) {
-		err = ErrInSufficientBytes
-	}
-	buf.wIdx += n
-	return
+	return bufReadBytes(buf, b)
 }
 
 func (buf *duplicateBuf) WriteString(s string) (n int, err error) {
@@ -370,18 +348,7 @@ func (buf *duplicateBuf) ReadFrom(r io.Reader) (n int, err error) {
 }
 
 func (buf *duplicateBuf) ReadFromWithLen(len int, r io.Reader) (n int, err error) {
-	if buf.WriteableBytes() < len {
-		return 0, OutOfBufError("len of reading data is out of Buffer")
-	}
-
-	rb, err := r.Read(buf.Array()[buf.wIdx : buf.wIdx+len])
-
-	if rb < 0 {
-		panic(ReaderError("reader return nagative count from Read"))
-	}
-
-	buf.wIdx += rb
-	return rb, err
+	return bufReadFrom(buf, len, r)
 }
 
 func (buf *duplicateBuf) ReadByte() (rb byte, err error) {
@@ -395,15 +362,7 @@ func (buf *duplicateBuf) ReadByte() (rb byte, err error) {
 }
 
 func (buf *duplicateBuf) ReadBytes(b []byte) (n int, err error) {
-	if buf.ReadableBytes() < 1 {
-		return 0, ErrInSufficientBytes
-	}
-
-	n = copy(b, buf.Array()[buf.rIdx:buf.wIdx])
-	if n < len(b) {
-		err = ErrReadNoEnough
-	}
-	return
+	return bufReadBytes(buf, b)
 }
 
 func (buf *duplicateBuf) ReadString(len int) (rs string, err error) {
@@ -411,12 +370,10 @@ func (buf *duplicateBuf) ReadString(len int) (rs string, err error) {
 }
 
 type bufComponent struct {
-	src BaseBuf
+	sliced BaseBuf
 
 	sIdx int
 	eIdx int
-
-	srcAdj int
 }
 
 func (bc *bufComponent) length() int {
@@ -424,22 +381,22 @@ func (bc *bufComponent) length() int {
 }
 
 func (bc *bufComponent) index(i int) int {
-	return i + bc.srcAdj
+	return i - bc.sIdx
 }
 
 func (bc *bufComponent) reOffset(newOffset int) {
 	move := newOffset - bc.eIdx
 	bc.sIdx = newOffset
 	bc.eIdx += move
-	bc.srcAdj -= move
 }
 
 const (
 	defaultCompoentMaxSize = 8
 )
 
-type CompositeBuf struct {
+type compositeBuf struct {
 	child          []*bufComponent
+	childArrays    *bufArray
 	componentCount int
 	maxSize        int
 
@@ -449,13 +406,23 @@ type CompositeBuf struct {
 	lastComp *bufComponent
 }
 
-func CompositeBuffer(buffers ...BaseBuf) *CompositeBuf {
-	return _NewCompositeBuf(defaultBufSize, buffers...)
+func CompositeBuffer(buffers ...BaseBuf) *compositeBuf {
+	return _NewCompositeBuf(defaultCompoentMaxSize, buffers...)
 }
 
-func _NewCompositeBuf(maxSize int, buffers ...BaseBuf) *CompositeBuf {
+func _NewCompositeBuf(maxSize int, buffers ...BaseBuf) *compositeBuf {
 	var initCap int
 	bufLen := len(buffers)
+
+	if bufLen == 0 {
+		return &compositeBuf{
+			child:          make([]*bufComponent, defaultBufSize),
+			lastComp:       &bufComponent{},
+			maxSize:        initCap,
+			componentCount: 0,
+			wIdx:           0,
+		}
+	}
 
 	if maxSize > bufLen {
 		initCap = maxSize
@@ -474,12 +441,15 @@ func _NewCompositeBuf(maxSize int, buffers ...BaseBuf) *CompositeBuf {
 		count++
 	}
 
-	return &CompositeBuf{
+	p := &compositeBuf{
 		child:          compoments,
 		lastComp:       &bufComponent{},
 		maxSize:        initCap,
 		componentCount: count,
+		wIdx:           compoments[count-1].eIdx,
 	}
+	p.buildBufArray()
+	return p
 }
 
 func _NewBufComponent(offset int, src BaseBuf) *bufComponent {
@@ -487,14 +457,29 @@ func _NewBufComponent(offset int, src BaseBuf) *bufComponent {
 	length := src.ReadableBytes()
 
 	return &bufComponent{
-		src:    src,
+		sliced: Slice(src, srcOffset, srcOffset+length),
 		sIdx:   offset,
 		eIdx:   offset + length,
-		srcAdj: srcOffset - offset,
 	}
 }
 
-func (buf *CompositeBuf) findComponent(idx int) (bc *bufComponent, err error) {
+func (buf *compositeBuf) buildBufArray() {
+	heap := &bufArray{}
+	tail := heap
+	l := buf.componentCount
+
+	for i := 0; i < l; i++ {
+		c := buf.child[i]
+		tail.data = c.sliced.Array().data
+		if i < l-1 {
+			tail.next = &bufArray{}
+			tail = tail.next
+		}
+	}
+	buf.childArrays = heap
+}
+
+func (buf *compositeBuf) findComponent(idx int) (bc *bufComponent, err error) {
 
 	if *buf.lastComp != (bufComponent{}) && buf.lastComp.sIdx <= idx && buf.lastComp.eIdx > idx {
 		return buf.lastComp, nil
@@ -510,14 +495,14 @@ func (buf *CompositeBuf) findComponent(idx int) (bc *bufComponent, err error) {
 	return
 }
 
-func (buf *CompositeBuf) binarySearchComponent(idx int) (i int, err error) {
+func (buf *compositeBuf) binarySearchComponent(idx int) (i int, err error) {
 	err = checkIndex(idx, buf)
 	if err != nil {
 		return
 	}
 
 	start := 0
-	end := len(buf.child) - 1
+	end := buf.componentCount - 1
 
 	for {
 		mid := (end - start) >> 1
@@ -537,31 +522,29 @@ func (buf *CompositeBuf) binarySearchComponent(idx int) (i int, err error) {
 	}
 }
 
-func (buf *CompositeBuf) Size() int {
-	return buf.child[len(buf.child)].eIdx
+func (buf *compositeBuf) mergaChild(from, to int) {
+	//TODO
 }
 
-func (buf *CompositeBuf) Array() []byte {
-	switch len(buf.child) {
-	case 1:
-		return buf.child[0].src.Array()
-	default:
-		return nil
+func (buf *compositeBuf) Size() int {
+	if buf.componentCount == 0 {
+		return 0
 	}
+	return buf.child[buf.componentCount-1].eIdx
 }
 
-func (buf *CompositeBuf) Copy() BaseBuf {
+func (buf *compositeBuf) Array() *bufArray {
+	return buf.childArrays
+}
+
+func (buf *compositeBuf) Copy() BaseBuf {
 	data := make([]byte, buf.Size())
-
-	offset := 0
-	for _, c := range buf.child {
-		offset += copy(data[offset:], c.src.Array()[c.sIdx:c.eIdx])
-	}
-
-	return NewBufWithArray(data)
+	cp := NewBufWithArray(data)
+	transfor(cp, buf)
+	return cp
 }
 
-func (buf *CompositeBuf) WriteIndex(idx int) error {
+func (buf *compositeBuf) WriteIndex(idx int) error {
 	err := checkIndex(idx, buf)
 	if err != nil {
 		return err
@@ -571,7 +554,7 @@ func (buf *CompositeBuf) WriteIndex(idx int) error {
 	return nil
 }
 
-func (buf *CompositeBuf) ReadIndex(idx int) error {
+func (buf *compositeBuf) ReadIndex(idx int) error {
 	err := checkIndex(idx, buf)
 	if err != nil {
 		return err
@@ -581,23 +564,23 @@ func (buf *CompositeBuf) ReadIndex(idx int) error {
 	return nil
 }
 
-func (buf *CompositeBuf) GetWriteIndex() int {
+func (buf *compositeBuf) GetWriteIndex() int {
 	return buf.wIdx
 }
 
-func (buf *CompositeBuf) GetReadIndex() int {
+func (buf *compositeBuf) GetReadIndex() int {
 	return buf.rIdx
 }
 
-func (buf *CompositeBuf) WriteableBytes() int {
+func (buf *compositeBuf) WriteableBytes() int {
 	return buf.wIdx - buf.Size()
 }
 
-func (buf *CompositeBuf) ReadableBytes() int {
+func (buf *compositeBuf) ReadableBytes() int {
 	return buf.wIdx - buf.rIdx
 }
 
-func (buf *CompositeBuf) DiscardReadBytes() {
+func (buf *compositeBuf) DiscardReadBytes() {
 	if buf.rIdx == 0 {
 		return
 	}
@@ -608,6 +591,7 @@ func (buf *CompositeBuf) DiscardReadBytes() {
 
 	if rOffset == wOffset && wOffset == buf.Size() {
 		buf.lastComp = nil
+		buf.childArrays = nil
 		for i := range buf.child {
 			buf.child[i] = nil
 		}
@@ -631,131 +615,49 @@ func (buf *CompositeBuf) DiscardReadBytes() {
 
 		c.sIdx = 0
 		c.eIdx -= rOffset
-		c.srcAdj -= rOffset
 
 		copy(buf.child, buf.child[first:])
 		buf.rIdx = 0
 		buf.wIdx -= rOffset
+		buf.buildBufArray()
 	}
 }
 
-func (buf *CompositeBuf) GetByte(i int) (b byte, err error) {
+func (buf *compositeBuf) GetByte(i int) (b byte, err error) {
 	c, err := buf.findComponent(i)
 	if err != nil {
 		return 0, err
 	}
 
-	idx := c.index(i)
-	b, err = c.src.GetByte(idx)
-	if err != nil {
-		return 0, err
-	}
-
-	return
+	return c.sliced.GetByte(c.index(i))
 }
 
-func (buf *CompositeBuf) GetBytes(i int, dst []byte) error {
-	idx, err := buf.binarySearchComponent(i)
-	if err != nil {
-		return err
-	}
-
-	for offset := 0; offset > len(dst); {
-		if idx >= buf.componentCount {
-			return ErrInSufficientBytes
-		}
-		componet := buf.child[idx]
-		cOffset := componet.index(i)
-
-		if err != nil {
-			return err
-		}
-
-		l := copy(dst[offset:], componet.src.Array()[cOffset:componet.eIdx])
-		offset += l
-		i += l
-		idx++
-	}
-	return nil
+func (buf *compositeBuf) GetBytes(i int, dst []byte) error {
+	return bufGetBytes(buf, i, dst)
 }
 
-func (buf *CompositeBuf) SetByte(i int, b byte) error {
+func (buf *compositeBuf) SetByte(i int, b byte) error {
 	c, err := buf.findComponent(i)
 	if err != nil {
 		return err
 	}
 
-	idx := c.index(i)
-	return c.src.SetByte(idx, b)
+	return c.sliced.SetByte(c.index(i), b)
 }
 
-func (buf *CompositeBuf) SetBytes(i int, src []byte) error {
-	idx, err := buf.binarySearchComponent(i)
-	if err != nil {
-		return err
-	}
-
-	for offset := 0; offset > len(src); {
-		if idx >= buf.componentCount {
-			return ErrInSufficientBytes
-		}
-
-		componet := buf.child[idx]
-		cOffset := componet.index(i)
-
-		if err != nil {
-			return err
-		}
-
-		l := componet.length()
-		copy(componet.src.Array()[cOffset:], src[offset:l])
-		offset += l
-		i += l
-		idx++
-	}
-	return nil
+func (buf *compositeBuf) SetBytes(i int, src []byte) error {
+	return bufSetBytes(buf, i, src)
 }
 
-func (buf *CompositeBuf) WriteTo(w io.Writer) error {
+func (buf *compositeBuf) WriteTo(w io.Writer) error {
 	return buf.WriteToWithLen(buf.ReadableBytes(), w)
 }
 
-func (buf *CompositeBuf) WriteToWithLen(len int, w io.Writer) error {
-	idx, err := buf.binarySearchComponent(buf.rIdx)
-	if err != nil {
-		return err
-	}
-
-	offset := buf.rIdx
-	for ; len > 0 && idx < buf.componentCount; idx++ {
-		c := buf.child[idx]
-		cOffset := c.index(offset)
-		remain := c.length() - cOffset
-
-		wb, err := w.Write(c.src.Array()[cOffset : cOffset+remain])
-
-		if wb < remain && err == nil {
-			err = io.ErrShortWrite
-		}
-
-		if err != nil {
-			buf.ReadIndex(buf.rIdx + wb)
-			return err
-		}
-
-		len -= wb
-		offset += wb
-	}
-
-	buf.ReadIndex(offset)
-	if len > 0 {
-		return ErrInSufficientBytes
-	}
-
-	return nil
+func (buf *compositeBuf) WriteToWithLen(len int, w io.Writer) error {
+	return bufWriteTo(buf, len, w)
 }
 
-func (buf *CompositeBuf) WriteByte(b byte) error {
+func (buf *compositeBuf) WriteByte(b byte) error {
 	if buf.WriteableBytes() < 1 {
 		return ErrInSufficientBytes
 	}
@@ -765,83 +667,23 @@ func (buf *CompositeBuf) WriteByte(b byte) error {
 	return nil
 }
 
-func (buf *CompositeBuf) WriteBytes(b []byte) (n int, err error) {
-	if buf.WriteableBytes() < 1 {
-		return 0, ErrInSufficientBytes
-	}
-
-	idx, err := buf.binarySearchComponent(buf.wIdx)
-	if err != nil {
-		return 0, err
-	}
-
-	offset := buf.wIdx
-	len := len(b)
-	for ; n < len && idx < buf.componentCount; idx++ {
-		c := buf.child[idx]
-		cOffset := c.index(offset)
-		remain := c.length() - cOffset
-
-		wb := copy(c.src.Array()[cOffset:cOffset+remain], b[n:])
-
-		len -= wb
-		offset += wb
-		n += wb
-	}
-
-	if n < len {
-		err = ErrInSufficientBytes
-	}
-	buf.WriteIndex(offset)
-	return
+func (buf *compositeBuf) WriteBytes(b []byte) (n int, err error) {
+	return bufWriteBytes(buf, b)
 }
 
-func (buf *CompositeBuf) WriteString(s string) (n int, err error) {
+func (buf *compositeBuf) WriteString(s string) (n int, err error) {
 	return unsafeWriteString(s, buf)
 }
 
-func (buf *CompositeBuf) ReadFrom(r io.Reader) (n int, err error) {
+func (buf *compositeBuf) ReadFrom(r io.Reader) (n int, err error) {
 	return buf.ReadFromWithLen(buf.WriteableBytes(), r)
 }
 
-func (buf *CompositeBuf) ReadFromWithLen(len int, r io.Reader) (n int, err error) {
-	if buf.WriteableBytes() < len {
-		return 0, OutOfBufError("len for reading data is out of Buffer")
-	}
-
-	idx, err := buf.binarySearchComponent(buf.rIdx)
-	if err != nil {
-		return 0, err
-	}
-
-	offset := buf.wIdx
-	for ; len > 0 && idx < buf.componentCount; idx++ {
-		c := buf.child[idx]
-		cOffset := c.index(offset)
-		remain := c.length() - cOffset
-
-		rb, err := r.Read(c.src.Array()[cOffset : cOffset+remain])
-
-		if rb < 0 {
-			panic(ReaderError("reader returned nagative count from Read"))
-		}
-
-		if err != nil {
-			n = offset - buf.wIdx
-			buf.WriteIndex(buf.wIdx + rb)
-			return n, err
-		}
-
-		len -= rb
-		offset += rb
-	}
-
-	n = offset - buf.wIdx
-	buf.WriteIndex(offset)
-	return
+func (buf *compositeBuf) ReadFromWithLen(len int, r io.Reader) (n int, err error) {
+	return bufReadFrom(buf, len, r)
 }
 
-func (buf *CompositeBuf) ReadByte() (rb byte, err error) {
+func (buf *compositeBuf) ReadByte() (rb byte, err error) {
 	if buf.ReadableBytes() < 1 {
 		return 0, ErrInSufficientBytes
 	}
@@ -851,44 +693,28 @@ func (buf *CompositeBuf) ReadByte() (rb byte, err error) {
 	return
 }
 
-func (buf *CompositeBuf) ReadBytes(b []byte) (n int, err error) {
-	if buf.WriteableBytes() < 1 {
-		return 0, ErrInSufficientBytes
-	}
-
-	idx, err := buf.binarySearchComponent(buf.rIdx)
-	if err != nil {
-		return 0, err
-	}
-
-	offset := buf.rIdx
-	len := len(b)
-	writeIndex := buf.GetWriteIndex()
-	for ; n < len && idx < buf.componentCount; idx++ {
-		c := buf.child[idx]
-		cOffset := c.index(offset)
-		remain := c.length() - cOffset
-
-		if (offset + remain) > writeIndex {
-			remain = c.index(writeIndex) - cOffset
-			//break the loop
-			idx = buf.componentCount
-		}
-
-		rb := copy(b[n:], c.src.Array()[cOffset:cOffset+remain])
-
-		len -= rb
-		offset += rb
-		n += rb
-	}
-
-	if n < len {
-		err = ErrInSufficientBytes
-	}
-	buf.ReadIndex(offset)
-	return
+func (buf *compositeBuf) ReadBytes(b []byte) (n int, err error) {
+	return bufReadBytes(buf, b)
 }
 
-func (buf *CompositeBuf) ReadString(len int) (rs string, err error) {
+func (buf *compositeBuf) ReadString(len int) (rs string, err error) {
 	return unsafeReadString(len, buf)
+}
+
+type bufferWriter struct {
+	buf BaseBuf
+}
+
+func NewBufferWriter(buf BaseBuf) *bufferWriter {
+	return &bufferWriter{
+		buf: buf,
+	}
+}
+
+func (bw *bufferWriter) Write(p []byte) (n int, err error) {
+	return bw.buf.WriteBytes(p)
+}
+
+func (bw *bufferWriter) WriteString(s string) (n int, err error) {
+	return bw.buf.WriteString(s)
 }
