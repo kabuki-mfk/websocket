@@ -336,6 +336,7 @@ func bufSetBytes(dstBuf BaseBuf, i int, src []byte) error {
 
 func bufWriteBytes(dstBuf BaseBuf, src []byte) (n int, err error) {
 	dstLen := dstBuf.WriteableBytes()
+	srcLen := len(src)
 	if dstLen < 1 {
 		return 0, ErrInSufficientBytes
 	}
@@ -346,10 +347,10 @@ func bufWriteBytes(dstBuf BaseBuf, src []byte) (n int, err error) {
 	dstLen -= l
 	n += l
 
-	if dstLen > 1 && array.next != nil {
+	if n < srcLen && dstLen > 1 && array.next != nil {
 		sOffset := l
 		array = array.next
-		for {
+		for n < srcLen {
 			l = copy(array.data, src[sOffset:])
 			dstLen -= l
 			n += l
@@ -373,26 +374,27 @@ func bufWriteBytes(dstBuf BaseBuf, src []byte) (n int, err error) {
 }
 
 func bufReadBytes(srcBuf BaseBuf, dst []byte) (n int, err error) {
-	dstLen := srcBuf.ReadableBytes()
-	if dstLen < 1 {
+	srcLen := srcBuf.ReadableBytes()
+	dstLen := len(dst)
+	if srcLen < 1 {
 		return 0, ErrInSufficientBytes
 	}
 	rIndex := srcBuf.GetReadIndex()
 	offset, array := findArray(srcBuf.Array(), rIndex)
 
 	l := copy(dst, array.data[offset:])
-	dstLen -= l
+	srcLen -= l
 	n += l
 
-	if dstLen > 1 && array.next != nil {
+	if n < dstLen && srcLen > 1 && array.next != nil {
 		dOffset := l
 		array = array.next
-		for {
+		for n < dstLen {
 			l = copy(dst[dOffset:], array.data)
-			dstLen -= l
+			srcLen -= l
 			n += l
 
-			if dstLen < 1 {
+			if srcLen < 1 {
 				break
 			}
 
