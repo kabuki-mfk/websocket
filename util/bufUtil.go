@@ -1,8 +1,10 @@
 package util
 
 import (
+	"bytes"
 	"errors"
 	"io"
+	"unsafe"
 )
 
 type sliceBuf struct {
@@ -485,6 +487,14 @@ func (buf *compositeBuf) findComponent(idx int) (bc *bufComponent, err error) {
 		return buf.lastComp, nil
 	}
 
+	if buf.componentCount == 0 {
+		return
+	}
+
+	if buf.componentCount == 1 {
+		return buf.child[0], nil
+	}
+
 	i, err := buf.binarySearchComponent(idx)
 
 	if err == nil {
@@ -505,13 +515,13 @@ func (buf *compositeBuf) binarySearchComponent(idx int) (i int, err error) {
 	end := buf.componentCount - 1
 
 	for {
-		mid := (end - start) >> 1
+		mid := (end - start + 1) >> 1
 		bc := buf.child[mid]
 
 		if idx < bc.sIdx {
 			end = mid - 1
 		} else if idx >= bc.eIdx {
-			start = mid + 1
+			start = mid
 		} else {
 			return mid, nil
 		}
@@ -701,6 +711,11 @@ func (buf *compositeBuf) ReadString(len int) (rs string, err error) {
 	return unsafeReadString(len, buf)
 }
 
+func ResetBuf(buf BaseBuf) {
+	buf.ReadIndex(0)
+	buf.WriteIndex(0)
+}
+
 type bufferWriter struct {
 	buf BaseBuf
 }
@@ -717,4 +732,175 @@ func (bw *bufferWriter) Write(p []byte) (n int, err error) {
 
 func (bw *bufferWriter) WriteString(s string) (n int, err error) {
 	return bw.buf.WriteString(s)
+}
+
+type bufferReader struct {
+	buf BaseBuf
+	r   io.Reader
+}
+
+func NewBufferReader(buf BaseBuf, r io.Reader) *bufferReader {
+	return &bufferReader{
+		buf: buf,
+		r:   r,
+	}
+}
+
+func (br *bufferReader) Buffered() int {
+	return br.buf.GetWriteIndex()
+}
+
+func (br *bufferReader) fill() error {
+	n, err := br.buf.ReadFrom(br.r)
+
+	if err != ErrReadNoEnough {
+		return err
+	} else if n == 0 {
+		return io.ErrNoProgress
+	}
+
+	return nil
+}
+
+func (br *bufferReader) Read(p []byte) (n int, err error) {
+	return br.buf.ReadBytes(p)
+}
+
+func (br *bufferReader) ReadString(len int) (s string, err error) {
+	return br.buf.ReadString(len)
+}
+
+func (br *bufferReader) ReadLineBytes() ([]byte, error) {
+	var line []byte
+	for {
+		l, more, err := br.readLineSlice()
+		if err != nil {
+			return nil, err
+		}
+
+		if line == nil && !more {
+			return l, nil
+		}
+
+		line = append(line, l...)
+
+		if !more {
+			break
+		}
+	}
+	return line, nil
+}
+
+func (br *bufferReader) ReadLineString() (string, error) {
+	line, err := br.ReadLineBytes()
+	str := ""
+
+	if line != nil {
+		str = *(*string)(unsafe.Pointer(&line))
+	}
+
+	return str, err
+}
+
+func (br *bufferReader) readLineSlice() (p []byte, more bool, err error) {
+	idx, err := br.findSliceIdx('\n')
+	size := br.buf.Size()
+
+	var b byte
+	//buffer full?
+	if idx == -1 && br.Buffered() >= size {
+		b, _ = br.buf.GetByte(size - 1)
+		if b == '\r' {
+			p = make([]byte, br.buf.ReadableBytes()-1)
+			br.buf.ReadBytes(p)
+			return p, true, nil
+		}
+	}
+
+	if br.buf.ReadableBytes() == 0 {
+		p = nil
+		return
+	}
+
+	if b, _ = br.buf.GetByte(idx); b == '\n' {
+		drop := 1
+		if br.buf.ReadableBytes() > 1 {
+			if b, _ = br.buf.GetByte(idx - 1); b == '\r' {
+				drop = 2
+			}
+		}
+		bufSize := idx + 1 - br.buf.GetReadIndex()
+		p = make([]byte, bufSize-drop)
+		br.buf.ReadBytes(p)
+		br.buf.ReadIndex(br.buf.GetReadIndex() + drop)
+	}
+	return
+}
+
+func (br *bufferReader) findSliceIdx(delim byte) (int, error) {
+	rIdx := br.buf.GetReadIndex()
+	start, array := findArray(br.buf.Array(), rIdx)
+	size := br.buf.ReadableBytes()
+	length := len(array.data[start:])
+	end := start + length
+
+	bufOffset := rIdx - start
+
+	//out of writeIndex
+	if length > size {
+		end = start + size
+		length = size
+	}
+
+	//find index
+	i := bytes.IndexByte(array.data[start:end], delim)
+	if i != -1 {
+		return start + i + bufOffset, nil
+	}
+
+	s := end - start
+	//more data?
+	for {
+		if i == -1 && br.Buffered() >= br.buf.Size() {
+			break
+		}
+
+		//try to fill
+		err := br.fill()
+		if err != nil {
+			return -1, err
+		}
+
+		size = br.Buffered()
+
+		for length < size {
+			//calc start index
+			start += s
+			if start >= len(array.data) {
+				if array.Next() == nil {
+					break
+				}
+				bufOffset += len(array.data)
+				array = array.Next()
+				start = 0
+			}
+
+			//calc end index
+			if br.buf.GetWriteIndex()-bufOffset > len(array.data) {
+				end = len(array.data)
+			} else {
+				end = br.buf.GetWriteIndex() - bufOffset
+			}
+
+			i = bytes.IndexByte(array.data[start:end], delim)
+			s = end - start
+			length += s
+
+			if i != -1 {
+				return i + bufOffset, nil
+			}
+		}
+	}
+
+	return -1, nil
 }
